@@ -45,14 +45,14 @@ func newUptokenClient(token string, transport http.RoundTripper) *http.Client {
 
 // ----------------------------------------------------------
 
-func (p Uploader) mkblk(
+func (p Uploader) Mkblk(
 	ctx Context, ret *BlkputRet, blockSize int, body io.Reader, size int) error {
 
 	url := p.UpHosts[0] + "/mkblk/" + strconv.Itoa(blockSize)
 	return p.Conn.CallWith(ctx, ret, "POST", url, "application/octet-stream", body, size)
 }
 
-func (p Uploader) bput(
+func (p Uploader) Bput(
 	ctx Context, ret *BlkputRet, body io.Reader, size int) error {
 
 	url := ret.Host + "/bput/" + ret.Ctx + "/" + strconv.FormatUint(uint64(ret.Offset), 10)
@@ -82,7 +82,8 @@ func (p Uploader) resumableBput(
 		body1 := io.NewSectionReader(f, offbase, int64(bodyLength))
 		body := io.TeeReader(body1, h)
 
-		err = p.mkblk(ctx, ret, blkSize, body, bodyLength)
+		// todo: need check hash and length
+		err = p.Mkblk(ctx, ret, blkSize, body, bodyLength)
 		if err != nil {
 			return
 		}
@@ -103,12 +104,12 @@ func (p Uploader) resumableBput(
 
 		tryTimes := extra.TryTimes
 
-lzRetry:
+	lzRetry:
 		h.Reset()
 		body1 := io.NewSectionReader(f, offbase+int64(ret.Offset), int64(bodyLength))
 		body := io.TeeReader(body1, h)
 
-		err = p.bput(ctx, ret, body, bodyLength)
+		err = p.Bput(ctx, ret, body, bodyLength)
 		if err == nil {
 			if ret.Crc32 == h.Sum32() {
 				extra.Notify(blkIdx, blkSize, ret)
@@ -136,7 +137,7 @@ lzRetry:
 
 // ----------------------------------------------------------
 
-func (p Uploader) mkfile(
+func (p Uploader) Mkfile(
 	ctx Context, ret interface{}, key string, hasKey bool, fsize int64, extra *RputExtra) (err error) {
 
 	url := p.UpHosts[0] + "/mkfile/" + strconv.FormatInt(fsize, 10)

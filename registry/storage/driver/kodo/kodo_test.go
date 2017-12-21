@@ -1,7 +1,6 @@
 package kodo
 
 import (
-	"io/ioutil"
 	"os"
 	"strconv"
 	"testing"
@@ -12,7 +11,6 @@ import (
 
 	"github.com/docker/distribution/context"
 	storagedriver "github.com/docker/distribution/registry/storage/driver"
-	"github.com/docker/distribution/registry/storage/driver/testsuites"
 )
 
 // Hook up gocheck into the "go test" runner.
@@ -27,22 +25,15 @@ func init() {
 	secretKey := os.Getenv("KODO_SECRET_KEY")
 	bucket := os.Getenv("KODO_BUCKET")
 	baseURL := os.Getenv("KODO_BASE_URL")
-	uidStr := os.Getenv("KODO_USER_UID")
-	refreshUrl := os.Getenv("KODO_REFRESH_URL")
-	adminAk := os.Getenv("KODO_ADMIN_ACCESS_KEY")
-	adminSk := os.Getenv("KODO_ADMIN_SECRET_KEY")
-	uid, _ := strconv.ParseUint(uidStr, 10, 64)
-
 	debug := os.Getenv("KODO_DEBUG")
 
-	root, err := ioutil.TempDir("", "driver-")
-	if err != nil {
-		panic(err)
-	}
-	defer os.Remove(root)
+	zone = "0"
+	bucket = "registry-dev-cloudappl-com"
+	debug = "true"
 
 	kodoDriverConstructor = func(rootDirectory string) (*Driver, error) {
 		var zoneValue int64
+		var err error
 		if zone != "" {
 			zoneValue, err = strconv.ParseInt(zone, 10, 64)
 			if err != nil {
@@ -55,19 +46,16 @@ func init() {
 			SecretKey: secretKey,
 		}
 		if debug != "" {
-			config.Transport = NewTransportWithLogger()
+			config.Transport = NewTransportWithLogger("")
 		}
 
 		parameters := DriverParameters{
-			int(zoneValue),
-			bucket,
-			baseURL,
-			rootDirectory,
-			config,
-			uid,
-			adminAk,
-			adminSk,
-			refreshUrl,
+			Zone:          int(zoneValue),
+			Bucket:        bucket,
+			BaseURL:       baseURL,
+			RootDirectory: rootDirectory,
+			Config:        config,
+			ChunkSize:     defaultChunkSize,
 		}
 
 		return New(parameters)
@@ -77,16 +65,9 @@ func init() {
 		if accessKey == "" || secretKey == "" || bucket == "" || baseURL == "" {
 			return "Must set KODO_ACCESS_KEY, KODO_SECRET_KEY, KODO_BUCKET, KODO_BASE_URL to run kodo tests"
 		}
-
-		if uid == 0 || refreshUrl == "" || adminAk == "" || adminSk == "" {
-			return "Hack！！ Must set KODO_USER_UID, KODO_REFRESH_URL, KODO_ADMIN_ACCESS_KEY, nKODO_ADMIN_SECRET_KEY"
-		}
 		return ""
 	}
 
-	testsuites.RegisterSuite(func() (storagedriver.StorageDriver, error) {
-		return kodoDriverConstructor(root)
-	}, skipkodo)
 }
 
 func TestEmptyRootList(t *testing.T) {
@@ -94,13 +75,7 @@ func TestEmptyRootList(t *testing.T) {
 		t.Skip(skipkodo())
 	}
 
-	validRoot, err := ioutil.TempDir("", "driver-")
-	if err != nil {
-		t.Fatalf("unexpected error creating temporary directory: %v", err)
-	}
-	defer os.Remove(validRoot)
-
-	rootedDriver, err := kodoDriverConstructor(validRoot)
+	rootedDriver, err := kodoDriverConstructor("test123")
 	if err != nil {
 		t.Fatalf("unexpected error creating rooted driver: %v", err)
 	}
@@ -122,7 +97,39 @@ func TestEmptyRootList(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error creating content: %v", err)
 	}
-	defer rootedDriver.Delete(ctx, filename)
+
+	_, err = rootedDriver.Stat(ctx, filename)
+	if err != nil {
+		t.Fatalf("unexpected error Stat: %v", err)
+	}
+
+	// defer rootedDriver.Delete(ctx, filename)
+
+	filename2 := "/test2"
+	writer, err := rootedDriver.Writer(ctx, filename2, false)
+	if err != nil {
+		t.Fatalf("unexpected error creating Writer: %v", err)
+	}
+
+	// t.Fatalf("%+v", writer)
+
+	for i := 0; i < 400; i++ {
+		_, err = writer.Write([]byte("1234567890123456789012345678901234567890"))
+		if err != nil {
+			t.Fatalf("unexpected error Writer write: %v", err)
+		}
+	}
+
+	err = writer.Commit()
+	if err != nil {
+		t.Fatalf("unexpected error Writer write: %v", err)
+	}
+
+	info, err := rootedDriver.Stat(ctx, filename2)
+	if err != nil {
+		t.Fatalf("unexpected error Stat: %v", err)
+	}
+	t.Fatal(info)
 
 	keys, err := emptyRootDriver.List(ctx, "/")
 	for _, path := range keys {

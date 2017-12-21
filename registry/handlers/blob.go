@@ -66,7 +66,7 @@ func (bh *blobHandler) GetBlob(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		time.Sleep(time.Millisecond * 500)
-		context.GetLogger(bh).Info("GetBlob Retry Triggered")
+		context.GetLogger(bh).Info("GetBlob Retry Triggered", err)
 	}
 	// add by wanglei, add a chance for retrying }
 	if err != nil {

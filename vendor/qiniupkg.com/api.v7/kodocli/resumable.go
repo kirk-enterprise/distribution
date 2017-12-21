@@ -254,7 +254,7 @@ func (p Uploader) rput(
 		return ErrPutFailed
 	}
 
-	return p.mkfile(ctx, ret, key, hasKey, fsize, extra)
+	return p.Mkfile(ctx, ret, key, hasKey, fsize, extra)
 }
 
 func (p Uploader) rputFile(
