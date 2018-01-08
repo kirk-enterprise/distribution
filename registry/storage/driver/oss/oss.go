@@ -661,15 +661,9 @@ func (w *writer) Commit() error {
 // flushPart flushes buffers to write a part to S3.
 // Only called by Write (with both buffers full) and Close/Commit (always)
 func (w *writer) flushPart() error {
-	if len(w.readyPart) == 0 && len(w.pendingPart) == 0 {
+	if len(w.readyPart) == 0 {
 		// nothing to write
 		return nil
-	}
-	if len(w.pendingPart) < int(w.driver.ChunkSize) {
-		// closing with a small pending part
-		// combine ready and pending to avoid writing a small part
-		w.readyPart = append(w.readyPart, w.pendingPart...)
-		w.pendingPart = nil
 	}
 
 	part, err := w.multi.PutPart(len(w.parts)+1, bytes.NewReader(w.readyPart))

@@ -11,10 +11,12 @@ import (
 
 type TransportWithLogger struct {
 	*http.Transport
+	token string
 }
 
-func NewTransportWithLogger() *TransportWithLogger {
+func NewTransportWithLogger(token string) *TransportWithLogger {
 	return &TransportWithLogger{
+		token: token,
 		Transport: &http.Transport{
 			Proxy: http.ProxyFromEnvironment,
 			Dial: (&net.Dialer{
@@ -28,7 +30,10 @@ func NewTransportWithLogger() *TransportWithLogger {
 
 func (t *TransportWithLogger) RoundTrip(req *http.Request) (resp *http.Response, err error) {
 	start := time.Now()
-	logStart(start, req)
+	// logStart(start, req)
+	if t.token != "" {
+		req.Header.Set("Authorization", t.token)
+	}
 	resp, err = t.Transport.RoundTrip(req)
 	logEnd(start, req, resp, err)
 	return
@@ -43,7 +48,7 @@ type RespError interface {
 func logStart(start time.Time, req *http.Request) {
 	id := strconv.FormatInt(start.UnixNano(), 36)
 	addr := req.Host + " - " + req.URL.String()
-	logrus.Infof("[REQ_BEG][%s] %s %s", id, req.Method, addr)
+	logrus.Infof("[REQ_BEG][%s] %s %s %s", id, req.Method, addr, req.Header.Get("Authorization"))
 }
 
 func logEnd(start time.Time, req *http.Request, resp *http.Response, err error) {

@@ -9,19 +9,20 @@ package kodo
 
 import (
 	"bytes"
-	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Sirupsen/logrus"
 
-	"qiniupkg.com/api.v7/auth/qbox"
 	"qiniupkg.com/api.v7/kodo"
+	"qiniupkg.com/api.v7/kodocli"
 	"qiniupkg.com/x/rpc.v7"
 
 	"github.com/docker/distribution/context"
@@ -30,22 +31,77 @@ import (
 	"github.com/docker/distribution/registry/storage/driver/factory"
 )
 
+// cache file writer
+
 const driverName = "kodo"
 const listMax = 1000
 const defaultExpiry = 3600
+const defaultChunkSize = 1 << 22 // 4mb
+const minChunkSize = defaultChunkSize / 4
+
+var DataStore = &PutStore{store: make(map[string]*writer, 0)}
+
+// PutStore ...
+type PutStore struct {
+	sync.Mutex
+	store map[string]*writer // key : pathkey
+}
+
+// Get ...
+func (p *PutStore) Get(key string) (w *writer) {
+	p.Lock()
+	defer p.Unlock()
+	w, _ = p.store[key]
+	return
+}
+
+// Add ...
+func (p *PutStore) Add(key string, w *writer) {
+	p.Lock()
+	defer p.Unlock()
+	p.store[key] = w
+	return
+}
+
+// Del ...
+func (p *PutStore) Del(key string) {
+	p.Lock()
+	defer p.Unlock()
+	delete(p.store, key)
+
+	// trigger recycle
+	keyToDelete := []string{}
+	checklength := len(p.store)
+	if checklength > 5 {
+		checklength = 5
+	}
+
+	if checklength == 0 {
+		return
+	}
+	for k, a := range p.store {
+		checklength--
+		if checklength <= 0 {
+			break
+		}
+		if time.Now().Sub(a.created).Minutes() > 60 {
+			keyToDelete = append(keyToDelete, k)
+		}
+	}
+	for _, k := range keyToDelete {
+		delete(p.store, k)
+	}
+}
 
 // DriverParameters A struct that encapsulates all of the driver parameters after all values have been set
 type DriverParameters struct {
 	Zone          int
+	ChunkSize     int
 	Bucket        string
 	BaseURL       string
 	RootDirectory string
 	kodo.Config
 
-	UserUid     uint64
-	AdminAk     string
-	AdminSk     string
-	RefreshURL  string
 	RedirectMap map[string]string
 }
 
@@ -60,13 +116,19 @@ func (factory *kodoDriverFactory) Create(parameters map[string]interface{}) (sto
 	return FromParameters(parameters)
 }
 
+// FromParameters ...
 func FromParameters(parameters map[string]interface{}) (*Driver, error) {
-
-	var err error
 
 	params := DriverParameters{}
 
 	params.Zone, _ = parameters["zone"].(int)
+
+	if chuckSize, ok := parameters["chucksize"].(int); ok {
+		params.ChunkSize = chuckSize
+	}
+	if params.ChunkSize < minChunkSize {
+		params.ChunkSize = defaultChunkSize
+	}
 
 	params.Bucket = getParameter(parameters, "bucket")
 	if params.Bucket == "" {
@@ -86,30 +148,6 @@ func FromParameters(parameters map[string]interface{}) (*Driver, error) {
 	params.Config.SecretKey = getParameter(parameters, "secretkey")
 	if params.Config.SecretKey == "" {
 		return nil, fmt.Errorf("No secretkey parameter provided")
-	}
-
-	params.AdminAk = getParameter(parameters, "adminaccesskey")
-	if params.AdminAk == "" {
-		return nil, fmt.Errorf("No adminaccesskey parameter provided")
-	}
-
-	params.AdminSk = getParameter(parameters, "adminsecretkey")
-	if params.AdminSk == "" {
-		return nil, fmt.Errorf("No adminsecretkey parameter provided")
-	}
-
-	userUid := getParameter(parameters, "useruid")
-	if userUid == "" {
-		return nil, fmt.Errorf("No useruid parameter provided")
-	}
-	params.UserUid, err = strconv.ParseUint(userUid, 10, 64)
-	if err != nil {
-		return nil, fmt.Errorf("useruid format err: %v", err)
-	}
-
-	params.RefreshURL = getParameter(parameters, "refreshurl")
-	if params.RefreshURL == "" {
-		return nil, fmt.Errorf("No refreshurl parameter provided")
 	}
 
 	params.RootDirectory = getParameter(parameters, "rootdirectory")
@@ -134,7 +172,7 @@ func FromParameters(parameters map[string]interface{}) (*Driver, error) {
 		}
 	}
 
-	params.Config.Transport = NewTransportWithLogger()
+	params.Config.Transport = NewTransportWithLogger("")
 
 	logrus.Info("kodo.config", params)
 
@@ -145,15 +183,16 @@ type baseEmbed struct {
 	base.Base
 }
 
+// Driver ...
 type Driver struct {
 	baseEmbed
 }
 
+// New ...
 func New(params DriverParameters) (*Driver, error) {
 
 	client := kodo.New(params.Zone, &params.Config)
 	bucket := client.Bucket(params.Bucket)
-	refresh := qbox.NewClient(qbox.NewMac(params.AdminAk, params.AdminSk), params.Config.Transport)
 
 	params.RootDirectory = strings.TrimRight(params.RootDirectory, "/")
 
@@ -162,15 +201,9 @@ func New(params DriverParameters) (*Driver, error) {
 	}
 
 	d := &driver{
-		params:    params,
-		client:    client,
-		bucket:    &bucket,
-		refresh:   refresh,
-		refreshCh: make(chan string, 100),
-	}
-
-	for i := 0; i < 10; i++ {
-		go d.refreshWorker()
+		params: params,
+		client: client,
+		bucket: &bucket,
 	}
 
 	return &Driver{
@@ -183,11 +216,9 @@ func New(params DriverParameters) (*Driver, error) {
 }
 
 type driver struct {
-	params    DriverParameters
-	bucket    *kodo.Bucket
-	client    *kodo.Client
-	refresh   *http.Client
-	refreshCh chan string
+	params DriverParameters
+	bucket *kodo.Bucket
+	client *kodo.Client
 }
 
 // Name returns the human-readable "name" of the driver, useful in error
@@ -200,7 +231,7 @@ func (d *driver) Name() string {
 // GetContent retrieves the content stored at "path" as a []byte.
 // This should primarily be used for small objects.
 func (d *driver) GetContent(ctx context.Context, path string) ([]byte, error) {
-
+	debugLog("debugkodo GetContent " + path)
 	rc, err := d.Reader(ctx, path, 0)
 	if err != nil {
 		return nil, err
@@ -218,16 +249,11 @@ func (d *driver) GetContent(ctx context.Context, path string) ([]byte, error) {
 // PutContent stores the []byte content at a location designated by "path".
 // This should primarily be used for small objects.
 func (d *driver) PutContent(ctx context.Context, path string, content []byte) error {
-
+	debugLog("debugkodo PutContent " + path)
 	err := d.bucket.Put(ctx, nil, d.getKey(path), bytes.NewBuffer(content), int64(len(content)), nil)
-	if err == nil {
-		err1 := d.refreshCache(d.getKey(path))
-		if err1 != nil {
-			logrus.Errorln("debugkodo refreshCache", err1)
-		}
-		return err1
+	if err != nil {
+		logrus.Errorln("debugkodo PutContent", errorInfo(err))
 	}
-	logrus.Errorln("debugkodo PutContent", errorInfo(err))
 	return err
 }
 
@@ -235,7 +261,7 @@ func (d *driver) PutContent(ctx context.Context, path string, content []byte) er
 // with a given byte offset.
 // May be used to resume reading a stream by providing a nonzero offset.
 func (d *driver) Reader(ctx context.Context, path string, offset int64) (io.ReadCloser, error) {
-
+	debugLog("debugkodo Reader " + path)
 	policy := kodo.GetPolicy{Expires: defaultExpiry}
 	baseURL := d.params.BaseURL + d.getKey(path)
 	url := d.client.MakePrivateUrl(baseURL, &policy)
@@ -266,28 +292,45 @@ func (d *driver) Reader(ctx context.Context, path string, offset int64) (io.Read
 // Writer returns a FileWriter which will store the content written to it
 // at the location designated by "path" after the call to Commit.
 func (d *driver) Writer(ctx context.Context, path string, append bool) (storagedriver.FileWriter, error) {
-
-	var offset int64
-	if append {
-		stat, err := d.Stat(ctx, path)
-		if err != nil {
-			pathNotFoundErr := storagedriver.PathNotFoundError{Path: path, DriverName: driverName}
-			if err != pathNotFoundErr {
-				logrus.Errorln("debugkodo Writer", errorInfo(err))
-				return nil, err
-			}
-		} else {
-			offset = stat.Size()
-		}
+	debugLog("debugkodo Writer " + path + " " + strconv.FormatBool(append))
+	policy := &kodo.PutPolicy{
+		Scope:   d.bucket.Name,
+		Expires: 3600,
 	}
-	return newFileWriter(d, ctx, path, offset), nil
+
+	if append {
+		writer := DataStore.Get(d.getKey(path))
+		if writer == nil {
+			debugLog("debugkodo not found")
+			return nil, storagedriver.PathNotFoundError{Path: path, DriverName: driverName}
+		}
+		writer.closed = false
+		return writer, nil
+	}
+	// !appdend
+	writer := &writer{
+		driver:    d,
+		ctx:       ctx,
+		key:       d.getKey(path),
+		chuckSize: d.params.ChunkSize,
+		uploader: kodocli.NewUploader(d.params.Zone, &kodocli.UploadConfig{
+			UpHosts:   d.params.UpHosts,
+			Transport: NewTransportWithLogger("UpToken " + d.client.MakeUptoken(policy)),
+		}),
+	}
+	err := writer.initUpload()
+	if err != nil {
+		logrus.Errorln("debugkodo initUpload", errorInfo(err))
+	}
+	DataStore.Add(writer.key, writer)
+	return writer, err
 }
 
 // Stat retrieves the FileInfo for the given path, including the current
 // size in bytes and the creation time.
 func (d *driver) Stat(ctx context.Context, path string) (storagedriver.FileInfo, error) {
-
-	items, _, _, err := bucketlistWithRetry(d.bucket, ctx, d.getKey(path), "", "", 1)
+	debugLog("debugkodo Stat " + path)
+	items, _, _, err := bucketlistWithRetry(ctx, d.bucket, d.getKey(path), "", "", 1)
 	if err != nil {
 		if err != io.EOF {
 			logrus.Errorln("debugkodo Stat", errorInfo(err))
@@ -318,12 +361,13 @@ func (d *driver) Stat(ctx context.Context, path string) (storagedriver.FileInfo,
 	return storagedriver.FileInfoInternal{FileInfoFields: fi}, nil
 }
 
-func bucketlistWithRetry(b *kodo.Bucket, ctx context.Context, prefix, delimiter, marker string, limit int) (entries []kodo.ListItem, commonPrefixes []string, markerOut string, err error) {
-	for i := 0; i < 2; i++ {
+func bucketlistWithRetry(ctx context.Context, b *kodo.Bucket, prefix, delimiter, marker string, limit int) (entries []kodo.ListItem, commonPrefixes []string, markerOut string, err error) {
+	for i := 0; i < 3; i++ {
 		entries, commonPrefixes, markerOut, err = b.List(ctx, prefix, delimiter, marker, limit)
 		if err != nil {
 			if err1, ok := err.(*rpc.ErrorInfo); ok && err1.Code == 599 {
-				logrus.Infoln("bucketlistWithRetry triggered", errorInfo(err))
+				logrus.Infoln("debugkodo bucketlistWithRetry triggered", errorInfo(err))
+				time.Sleep(time.Millisecond * 500)
 				continue
 			}
 		}
@@ -361,7 +405,7 @@ func (d *driver) List(ctx context.Context, opath string) ([]string, error) {
 	)
 
 	for {
-		items, prefixes, marker, err = bucketlistWithRetry(d.bucket, ctx, d.getKey(path), "/", marker, listMax)
+		items, prefixes, marker, err = bucketlistWithRetry(ctx, d.bucket, d.getKey(path), "/", marker, listMax)
 		if err != nil {
 			if err != io.EOF {
 				logrus.Errorln("debugkodo bucketlistWithRetry", errorInfo(err))
@@ -397,7 +441,7 @@ func (d *driver) List(ctx context.Context, opath string) ([]string, error) {
 // Note: This may be no more efficient than a copy followed by a delete for
 // many implementations.
 func (d *driver) Move(ctx context.Context, sourcePath string, destPath string) error {
-
+	debugLog("debugkodo Move " + sourcePath + " " + destPath)
 	err := d.bucket.Move(ctx, d.getKey(sourcePath), d.getKey(destPath), true)
 	if err != nil {
 		logrus.Errorln("debugkodo Move", errorInfo(err))
@@ -407,7 +451,7 @@ func (d *driver) Move(ctx context.Context, sourcePath string, destPath string) e
 
 // Delete recursively deletes all objects stored at "path" and its subpaths.
 func (d *driver) Delete(ctx context.Context, path string) error {
-
+	debugLog("debugkodo Delete " + path)
 	var (
 		items  []kodo.ListItem
 		marker string
@@ -417,7 +461,7 @@ func (d *driver) Delete(ctx context.Context, path string) error {
 	)
 
 	for {
-		items, _, marker, err = bucketlistWithRetry(d.bucket, ctx, d.getKey(path), "", marker, listMax)
+		items, _, marker, err = bucketlistWithRetry(ctx, d.bucket, d.getKey(path), "", marker, listMax)
 		if err != nil {
 			if err != io.EOF {
 				logrus.Errorln("debugkodo Delete bucketlistWithRetry", errorInfo(err))
@@ -437,10 +481,6 @@ func (d *driver) Delete(ctx context.Context, path string) error {
 				if isKeyNotExists(err) {
 					continue
 				}
-				return err
-			}
-			err = d.refreshCache(item.Key)
-			if err != nil {
 				return err
 			}
 		}
@@ -483,32 +523,6 @@ func (d *driver) URLFor(ctx context.Context, path string, options map[string]int
 	return url, nil
 }
 
-func (d *driver) refreshCache(key string) (err error) {
-	// async
-	d.refreshCh <- key
-	// sync
-	// err = d.refreshCacheNow(key)
-	return
-}
-
-func (d *driver) refreshCacheNow(key string) (err error) {
-	memcacheKey := "io:" + strconv.FormatUint(uint64(d.params.UserUid), 36) + ":" + d.params.Bucket + ":" + key
-	encodedKey := base64.URLEncoding.EncodeToString([]byte(memcacheKey))
-	resp, err := d.refresh.Get(d.params.RefreshURL + "/" + encodedKey)
-	if err != nil {
-		logrus.Error("refresh failed:", encodedKey, err)
-		return
-	}
-	resp.Body.Close()
-	return
-}
-
-func (d *driver) refreshWorker() {
-	for key := range d.refreshCh {
-		d.refreshCacheNow(key)
-	}
-}
-
 func (d *driver) getKey(path string) string {
 	return strings.TrimLeft(d.params.RootDirectory+path, "/")
 }
@@ -518,31 +532,23 @@ func (d *driver) getKey(path string) string {
 // the call to Close, but is only required to make its content readable on a
 // call to Commit.
 type writer struct {
-	*driver
-	ctx  context.Context
-	path string
-
-	rd   *io.PipeReader
-	wt   *io.PipeWriter
-	size int64
-	from int64
-
+	created   time.Time
+	ctx       context.Context
+	driver    *driver
+	key       string
+	chuckSize int
+	uploader  kodocli.Uploader
+	parts     []*kodocli.BlkputRet
+	size      int64
+	buffer    []byte
 	closed    bool
 	committed bool
 	cancelled bool
-
-	exitch chan struct{}
-	err    error
-}
-
-func newFileWriter(d *driver, ctx context.Context, path string, size int64) storagedriver.FileWriter {
-	return &writer{
-		driver: d, ctx: ctx, path: path, from: size, size: size,
-		exitch: make(chan struct{}, 1),
-	}
+	wg        sync.WaitGroup
 }
 
 func (w *writer) Write(p []byte) (n int, err error) {
+	debugLog("debugkodo Write " + strconv.Itoa(len(p)) + " " + strconv.Itoa(len(w.buffer)))
 	if w.closed {
 		return 0, fmt.Errorf("already closed")
 	} else if w.committed {
@@ -551,71 +557,67 @@ func (w *writer) Write(p []byte) (n int, err error) {
 		return 0, fmt.Errorf("already cancelled")
 	}
 
-	if w.err != nil {
-		err = w.err
-		logrus.Errorln("debugkodo writer Write ", errorInfo(err))
-		return
-	}
+	for len(p) > 0 {
+		// If no parts are ready to write, fill up the first part
 
-	if w.rd == nil {
-		w.rd, w.wt = io.Pipe()
-		go w.background()
-	}
-	n, err = w.wt.Write(p)
-	if err != nil {
-		logrus.Errorln("debugkodo writer wt.Write ", errorInfo(err))
-		return
+		if neededBytes := w.chuckSize - len(w.buffer); neededBytes > 0 {
+			if len(p) >= neededBytes {
+				w.buffer = append(w.buffer, p[:neededBytes]...)
+				n += neededBytes
+				p = p[neededBytes:]
+				err := w.flushPart(false)
+				if err != nil {
+					w.size += int64(n)
+					return n, err
+				}
+			} else {
+				w.buffer = append(w.buffer, p...)
+				n += len(p)
+				p = nil
+			}
+		}
 	}
 	w.size += int64(n)
 	return
 }
 
-func (w *writer) Close() error {
-	if w.closed {
-		return fmt.Errorf("already closed")
-	}
-
-	w.close()
-	if w.err != nil {
-		logrus.Errorln("debugkodo writer close ", errorInfo(w.err))
-		return w.err
-	}
-
-	w.closed = true
-	return nil
-}
-
 // Size returns the number of bytes written to this FileWriter.
 func (w *writer) Size() int64 {
-	debugLog(fmt.Sprintf("getting size : %d %v", w.size, w.closed))
-	// if !w.closed {
-	// 	return w.size + w.bufferd
-	// }
 	return w.size
+}
+
+func (w *writer) Close() error {
+	debugLog("debugkodo Close " + w.key)
+	if w.closed {
+		logrus.Errorln("debugkodo writer close: already closed")
+		//return fmt.Errorf("already closed")
+	}
+	w.closed = true
+	return w.flushPart(false)
 }
 
 // Cancel removes any written content from this FileWriter.
 func (w *writer) Cancel() error {
+	debugLog("debugkodo Cancel " + w.key)
 	if w.closed {
+		logrus.Errorln("debugkodo writer cancel: already closed")
 		return fmt.Errorf("already closed")
 	} else if w.committed {
+		logrus.Errorln("debugkodo writer commit: already closed")
 		return fmt.Errorf("already committed")
 	}
-
-	w.close()
-
 	w.cancelled = true
-	err := w.Delete(w.ctx, w.path)
-	if err != nil {
-		logrus.Errorln("debugkodo writer cancel ", errorInfo(w.err))
-	}
-	return err
+	DataStore.Del(w.key)
+	// kodo目前不支持放弃上传的操作
+	// err := w.upload.Abort()
+	return nil
 }
 
 // Commit flushes all content written to this FileWriter and makes it
 // available for future calls to StorageDriver./ and
 // StorageDriver.Reader.
 func (w *writer) Commit() error {
+	debugLog("debugkodo Commit " + w.key)
 	if w.closed {
 		return fmt.Errorf("already closed")
 	} else if w.committed {
@@ -624,26 +626,57 @@ func (w *writer) Commit() error {
 		return fmt.Errorf("already cancelled")
 	}
 
-	w.close()
-	if w.err != nil {
-		logrus.Errorln("debugkodo writer Commit ", errorInfo(w.err))
-		return w.err
+	err := w.flushPart(true)
+	if err != nil {
+		return err
 	}
-
 	w.committed = true
+	err = w.Complete()
+	if err != nil {
+		// kodo目前不支持放弃上传的操作
+		// w.upload.Abort()
+		return err
+	}
+	DataStore.Del(w.key)
 	return nil
 }
 
-func (w *writer) close() {
-	debugLog(fmt.Sprintf("closing with size : %d", w.size))
-	if w.wt != nil {
-		w.wt.CloseWithError(io.EOF)
-		w.wt = nil
-		<-w.exitch
-		w.rd.CloseWithError(io.EOF)
-		w.rd = nil
-		close(w.exitch)
+func (w *writer) waitAndGetParts() (ret []kodocli.BlkputRet, err error) {
+	a := ""
+	w.wg.Wait()
+	for i, p := range w.parts {
+		if p.Offset > 0 {
+			a += fmt.Sprintf("%d %v ; ", i, p)
+			ret = append(ret, *(w.parts[i]))
+		}
+		if p.Offset == 0 && p.Ctx != "init" {
+			err = errors.New("some part has error")
+		}
 	}
+	logrus.Infoln("debugkodo blks", a)
+
+	return
+}
+
+func (w *writer) Complete() (err error) {
+	debugLog("debugkodo Complete " + w.key)
+	parts, err := w.waitAndGetParts()
+	if err != nil {
+		logrus.Errorln("debugkodo Mkfile error", errorInfo(err))
+		return
+	}
+	ret := kodocli.PutRet{}
+	for i := 0; i < 3; i++ {
+		err = w.uploader.Mkfile(context.Background(), &ret, w.key, true, w.size, &kodocli.RputExtra{
+			Progresses: parts,
+		})
+		if err != nil {
+			logrus.Errorln("debugkodo Mkfile error", errorInfo(err))
+		} else {
+			break
+		}
+	}
+	return
 }
 
 func debugLog(header string) {
@@ -659,38 +692,48 @@ func debugLog(header string) {
 	return
 }
 
-func (w *writer) background() {
-	key := w.getKey(w.path)
-	parts := make([]kodo.PutPart, 0, 2)
+func (w *writer) initUpload() (err error) {
+	// hack init
+	part := &kodocli.BlkputRet{
+		Ctx: "init",
+	}
+	w.parts = append(w.parts, part)
+	return
+}
 
-	defer func() {
-		w.exitch <- struct{}{}
-		debugLog(fmt.Sprintf("background close, size : %d", w.size))
-	}()
-
-	if w.from > 0 {
-		parts = append(parts, kodo.PutPart{
-			Key:  key,
-			From: 0,
-			To:   w.from,
-		})
+// flushPart flushes buffers to write a part to kodo.
+// Only called by Write (with both buffers full) and Close/Commit (always)
+func (w *writer) flushPart(isCommit bool) (err error) {
+	debugLog("debugkodo flushPart " + w.key + " " + strconv.Itoa(len(w.buffer)))
+	if len(w.buffer) != w.chuckSize && !isCommit {
+		// nothing to write
+		return nil
 	}
 
-	parts = append(parts, kodo.PutPart{
-		R: w.rd,
-	})
+	part := &kodocli.BlkputRet{}
+	w.wg.Add(1)
+	go func(buffer []byte) {
+		for i := 0; i < 3; i++ {
+			// todo: optimize retry logic and error/checksum check
+			err = w.uploader.Mkblk(context.Background(),
+				part, len(buffer), bytes.NewReader(buffer), len(buffer))
+			if err != nil {
+				logrus.Errorln("debugkodo Mkblk error", errorInfo(err))
+			} else {
+				logrus.Infoln("debugkodo Mkblk success", part)
+				break
+			}
+		}
+		w.wg.Done()
+	}(w.buffer)
 
-	w.err = w.bucket.PutParts(w.ctx, nil, key, []string{key}, parts, nil)
-	if w.err != nil {
-		logrus.Warn("writer background PutParts:", key, errorInfo(w.err))
-		return
+	if err != nil {
+		return err
 	}
 
-	w.err = w.refreshCache(key)
-	if w.err != nil {
-		logrus.Warn("writer background refreshCache:", key, errorInfo(w.err))
-		return
-	}
+	w.parts = append(w.parts, part)
+	w.buffer = nil
+	return nil
 }
 
 func isKeyNotExists(err error) bool {
@@ -720,5 +763,8 @@ func errorInfo(err error) string {
 	if err1, ok := err.(*rpc.ErrorInfo); ok {
 		return err1.ErrorDetail()
 	}
-	return err.Error()
+	if err != nil {
+		return err.Error()
+	}
+	return ""
 }
