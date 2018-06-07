@@ -35,7 +35,7 @@ func (bs *blobServer) ServeBlob(ctx context.Context, w http.ResponseWriter, r *h
 	}
 
 	if bs.redirect {
-		redirectURL, err := bs.driver.URLFor(ctx, path, map[string]interface{}{"method": r.Method})
+		redirectURL, err := bs.driver.URLFor(ctx, path, map[string]interface{}{"method": r.Method, "host": r.Host})
 		switch err.(type) {
 		case nil:
 			// Redirect to storage URL.

@@ -107,3 +107,18 @@ dep-validate: dep-restore
 	@test -z "$$(diff -r vendor .vendor.bak 2>&1 | tee /dev/stderr)" || \
 		(echo >&2 "+ borked dependencies! what you have in Godeps/Godeps.json does not match with what you have in vendor" && false)
 	@rm -Rf .vendor.bak
+
+run:
+	cd cmd/registry && go build && ./registry serve kodo-dev.yml
+
+BUILD_TAG=$(shell date +%Y%m%d%H%M%S)
+
+build_local_image:
+	go build -o ./bin/registry ./cmd/registry
+	docker build -t index-dev.qiniu.io/kelibrary/ke-registry:${BUILD_TAG} -f kodo.Dockerfile .
+	docker push index-dev.qiniu.io/kelibrary/ke-registry:${BUILD_TAG}
+
+build_cross_image:
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o ./bin/registry ./cmd/registry
+	docker build -t index-dev.qiniu.io/kelibrary/ke-registry:${BUILD_TAG} -f kodo.Dockerfile .
+	docker push index-dev.qiniu.io/kelibrary/ke-registry:${BUILD_TAG}

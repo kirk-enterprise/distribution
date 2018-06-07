@@ -247,6 +247,7 @@ func configureLogging(ctx context.Context, config *configuration.Configuration) 
 	case "text":
 		log.SetFormatter(&log.TextFormatter{
 			TimestampFormat: time.RFC3339Nano,
+			FullTimestamp:   true,
 		})
 	case "logstash":
 		log.SetFormatter(&logstash.LogstashFormatter{

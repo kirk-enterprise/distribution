@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"time"
 
 	"github.com/docker/distribution"
 	ctxu "github.com/docker/distribution/context"
@@ -61,6 +62,13 @@ func blobUploadDispatcher(ctx *Context, r *http.Request) http.Handler {
 
 		blobs := ctx.Repository.Blobs(buh)
 		upload, err := blobs.Resume(buh, buh.UUID)
+		// add by wanglei -> add chance for retry {
+		if err == nil && upload.Size() != buh.State.Offset {
+			ctxu.GetLogger(ctx).Warnf("retrying triggered")
+			time.Sleep(time.Second)
+			upload, err = blobs.Resume(buh, buh.UUID)
+		}
+		// add by wanglei -> add chance for retry }
 		if err != nil {
 			ctxu.GetLogger(ctx).Errorf("error resolving upload: %v", err)
 			if err == distribution.ErrBlobUploadUnknown {
