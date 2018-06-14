@@ -104,6 +104,13 @@ func TestAppDispatcher(t *testing.T) {
 			},
 		},
 		{
+			endpoint: v2.RouteNameTag,
+			vars: []string{
+				"name", "foo/bar",
+				"tag", "sometag",
+			},
+		},
+		{
 			endpoint: v2.RouteNameBlobUpload,
 			vars: []string{
 				"name", "foo/bar",

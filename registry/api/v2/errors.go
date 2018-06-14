@@ -61,6 +61,15 @@ var (
 		HTTPStatusCode: http.StatusNotFound,
 	})
 
+	// ErrorCodeTagUnknown when the tag is not known.
+	ErrorCodeTagUnknown = errcode.Register(errGroup, errcode.ErrorDescriptor{
+		Value:   "TAG_UNKNOWN",
+		Message: "tag not known to registry",
+		Description: `This is returned if the tag used during an operation is
+		unknown to the registry.`,
+		HTTPStatusCode: http.StatusNotFound,
+	})
+
 	// ErrorCodeManifestUnknown returned when image manifest is unknown.
 	ErrorCodeManifestUnknown = errcode.Register(errGroup, errcode.ErrorDescriptor{
 		Value:   "MANIFEST_UNKNOWN",

@@ -18,6 +18,14 @@ var (
 		Description: `Name of the target repository.`,
 	}
 
+	tagParameterDescriptor = ParameterDescriptor{
+		Name:        "tag",
+		Type:        "string",
+		Format:      reference.TagRegexp.String(),
+		Required:    true,
+		Description: `Tag of the target manifest.`,
+	}
+
 	referenceParameterDescriptor = ParameterDescriptor{
 		Name:        "reference",
 		Type:        "string",
@@ -494,6 +502,64 @@ var routeDescriptors = []RouteDescriptor{
 							repositoryNotFoundResponseDescriptor,
 							deniedResponseDescriptor,
 							tooManyRequestsDescriptor,
+						},
+					},
+				},
+			},
+		},
+	},
+	{
+		Name:        RouteNameTag,
+		Path:        "/v2/{name:" + reference.NameRegexp.String() + "}/tags/{tag:" + reference.TagRegexp.String() + "}",
+		Entity:      "Tags",
+		Description: "Delete tag",
+		Methods: []MethodDescriptor{
+			{
+				Method:      "DELETE",
+				Description: "Delete a tag identified by `name` and `tag`.",
+				Requests: []RequestDescriptor{
+					{
+						Name:        "Tags",
+						Description: "Delete a tag identified by `name` and `tag`.",
+						Headers: []ParameterDescriptor{
+							hostHeader,
+							authHeader,
+						},
+						PathParameters: []ParameterDescriptor{
+							nameParameterDescriptor,
+							tagParameterDescriptor,
+						},
+						Successes: []ResponseDescriptor{
+							{
+								StatusCode: http.StatusAccepted,
+							},
+						},
+						Failures: []ResponseDescriptor{
+							unauthorizedResponseDescriptor,
+							repositoryNotFoundResponseDescriptor,
+							deniedResponseDescriptor,
+							tooManyRequestsDescriptor,
+							{
+								Name:        "Unknown Tag",
+								Description: "The specified `name` or `Tag` are unknown to the registry and the delete was unable to proceed. Clients can assume the tag was already deleted if this response is returned.",
+								StatusCode:  http.StatusNotFound,
+								ErrorCodes: []errcode.ErrorCode{
+									ErrorCodeNameUnknown,
+									ErrorCodeTagUnknown,
+								},
+								Body: BodyDescriptor{
+									ContentType: "application/json; charset=utf-8",
+									Format:      errorsBody,
+								},
+							},
+							{
+								Name:        "Not allowed",
+								Description: "Tag delete is not allowed because the registry is configured as a pull-through cache or `delete` has been disabled.",
+								StatusCode:  http.StatusMethodNotAllowed,
+								ErrorCodes: []errcode.ErrorCode{
+									errcode.ErrorCodeUnsupported,
+								},
+							},
 						},
 					},
 				},
