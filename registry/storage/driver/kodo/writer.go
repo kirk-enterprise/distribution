@@ -104,7 +104,8 @@ func (fw *fileWriter) Commit() error {
 
 	//调用驱动上传文件
 	localFile := fw.file.Name()
-	if err := fw.driver.upload(fw.ctx, localFile, fw.kodoKey); err != nil {
+	fileSize := fw.Size()
+	if err := fw.driver.upload(fw.ctx, localFile, fileSize, fw.kodoKey); err != nil {
 		return err
 	}
 
