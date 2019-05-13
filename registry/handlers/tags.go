@@ -21,9 +21,31 @@ func tagsDispatcher(ctx *Context, r *http.Request) http.Handler {
 	}
 }
 
+// tagDispatcher constructs the tag delete handler
+func tagDispatcher(ctx *Context, r *http.Request) http.Handler {
+	tagHandler := &tagHandler{
+		Context: ctx,
+		Tag:  getTag(ctx),
+	}
+
+	thandler := handlers.MethodHandler{
+	}
+
+	if !ctx.readOnly {
+		thandler["DELETE"] = http.HandlerFunc(tagHandler.DeleteTag)
+	}
+
+	return thandler
+}
+
 // tagsHandler handles requests for lists of tags under a repository name.
 type tagsHandler struct {
 	*Context
+}
+
+type tagHandler struct {
+	*Context
+	Tag string
 }
 
 type tagsAPIResponse struct {
@@ -59,4 +81,15 @@ func (th *tagsHandler) GetTags(w http.ResponseWriter, r *http.Request) {
 		th.Errors = append(th.Errors, errcode.ErrorCodeUnknown.WithDetail(err))
 		return
 	}
+}
+
+// DeleteTag only do the untag and leave the manifest untouched
+func (th *tagHandler) DeleteTag(w http.ResponseWriter, r *http.Request) {
+	tagService := th.Repository.Tags(th)
+	if err := tagService.Untag(th.Context, th.Tag); err != nil {
+		th.Errors = append(th.Errors, err)
+		return
+	}
+
+	w.WriteHeader(http.StatusAccepted)
 }
